@@ -11,21 +11,146 @@
     #bar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
     select, button { padding: 6px 10px; background: #222; color: #ddd;
                      border: 1px solid #444; border-radius: 4px; }
+    button { cursor: pointer; }
+    button:hover { background: #2c2c2c; border-color: #666; }
+    button:active { background: #0ff2; border-color: #0ff; }
     #status { font-size: 13px; color: #888; font-variant-numeric: tabular-nums; }
+    #sens-wrap, #mode-wrap { display: flex; align-items: center; gap: 8px;
+                             font-size: 13px; color: #888; }
+    #sens { width: 110px; accent-color: #0ff; }
+    #sens-value { color: #ddd; font-variant-numeric: tabular-nums; width: 32px; }
     canvas { border: 1px solid #333; display: block; max-width: 100%; }
+    #canvases { display: flex; gap: 12px; flex-wrap: wrap; }
+    #bottom-bar { margin-top: 12px; font-size: 13px; color: #888;
+                  font-variant-numeric: tabular-nums; }
+    #note { margin-left: 16px; color: #0ff; }
+    /* control scheme reference */
+    #controls { display: flex; gap: 28px; flex-wrap: wrap;
+                margin-top: 14px; font-size: 12px; color: #888; }
+    #schema { border-collapse: collapse; }
+    #schema caption { text-align: left; color: #666; padding-bottom: 8px;
+                      max-width: 44ch; line-height: 1.5; }
+    #schema th, #schema td { border: 1px solid #2c2c2c; padding: 4px 9px;
+                             text-align: left; font-weight: 400; }
+    #schema thead th { color: #ddd; font-weight: 600; background: #1a1a1a; }
+    #schema tbody th { color: #ddd; font-weight: 600; text-align: center; }
+    #schema td.row { color: #0ff; }   /* matches the cyan slab preview */
+    #schema td.col { color: #f0f; }   /* matches the magenta slab preview */
+    #schema td.face { color: #ff0; }  /* matches the yellow slab preview */
+    #other { display: grid; grid-template-columns: auto 1fr;
+             gap: 4px 14px; margin: 0; align-content: start; }
+    #other dt { color: #ddd; }
+    #other dt.face { color: #ff0; }   /* matches the yellow slab preview */
+    #other dd { margin: 0; color: #888; }
+    #other code { color: #aaa; }
+    .stage { position: relative; }
+    /* hand pointer, drawn over the cube canvas; transform is set in JS */
+    #cursor {
+      position: absolute; left: 0; top: 0; width: 18px; height: 18px;
+      margin: -9px 0 0 -9px; border: 2px solid #0ff; border-radius: 50%;
+      opacity: 0; pointer-events: none; transition: opacity .1s, background .1s;
+    }
+    #cursor.arming { border-color: #ff0; }          /* pinch seen, not held yet */
+    #cursor.on { background: #0ff8; border-color: #fff; }
   </style>
 </head>
 <body>
   <div id="bar">
     <select id="cams"></select>
+    <button id="scramble" type="button">scramble</button>
+    <button id="reset" type="button">reset cube</button>
+    <label id="mode-wrap">pinch
+      <select id="pinch-mode">
+        <option value="rotate">rotates view</option>
+        <option value="move">moves cube</option>
+      </select>
+    </label>
+    <label id="sens-wrap">sensitivity
+      <input id="sens" type="range" min="0.5" max="3" step="0.1" value="1.6">
+      <span id="sens-value">1.6×</span>
+    </label>
     <span id="status">starting…</span>
   </div>
 
-  <canvas id="out" width="640" height="480"></canvas>
-  <video id="video" playsinline muted style="display:none"></video>
-  <div id="bottom-bar">
-    <span id = "hand"></span>
+  <div id="canvases">
+    <canvas id="out" width="640" height="480"></canvas>
+    <div class="stage">
+      <canvas id="rubik" width="640" height="480"></canvas>
+      <div id="cursor"></div>
+    </div>
   </div>
+
+  <div id="bottom-bar">
+    <span id="hand"></span>
+    <span id="note"></span>
+  </div>
+  <div id="controls">
+    <table id="schema">
+      <caption>
+        Hold up 1–3 fingers and point them the way the slab should go, then hold
+        the shape until the ring fills. Everything is relative to the view you
+        have now. The thumb is separate: out to the side, it turns the face
+        you're looking at, and the count stops mattering.
+      </caption>
+      <thead>
+        <tr>
+          <th>fingers</th>
+          <th>point <b>→</b></th>
+          <th>point <b>←</b></th>
+          <th>point <b>↑</b></th>
+          <th>point <b>↓</b></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>1</th>
+          <td class="row">top row right</td>
+          <td class="row">top row left</td>
+          <td class="col">left column up</td>
+          <td class="col">left column down</td>
+        </tr>
+        <tr>
+          <th>2</th>
+          <td class="row">middle row right</td>
+          <td class="row">middle row left</td>
+          <td class="col">middle column up</td>
+          <td class="col">middle column down</td>
+        </tr>
+        <tr>
+          <th>3</th>
+          <td class="row">bottom row right</td>
+          <td class="row">bottom row left</td>
+          <td class="col">right column up</td>
+          <td class="col">right column down</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <dl id="other">
+      <dt class="face">thumb out <b>→</b></dt>
+      <dd>turns the face you're looking at, clockwise — any finger count</dd>
+      <dt class="face">thumb out <b>←</b></dt>
+      <dd>the same face, anticlockwise</dd>
+      <dt>fist · 4 fingers</dt>
+      <dd>rest, as long as the thumb is tucked in</dd>
+      <dt>pinch + move</dt><dd>rotates the whole cube (or moves it, per the mode above)</dd>
+      <dt>mouse: drag a sticker</dt><dd>turns that layer</dd>
+      <dt>mouse: drag the background</dt><dd>orbits · right-drag pans · wheel zooms</dd>
+      <dt>console</dt><dd><code>cube.turnAll("R U R' U'")</code> · <code>cube.scramble()</code> · <code>cube.reset()</code></dd>
+    </dl>
+  </div>
+
+  <video id="video" playsinline muted style="display:none"></video>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/"
+      }
+    }
+  </script>
+  <!-- main.js pulls in interaction.js → cube.js -->
   <script type="module" src="main.js"></script>
 </body>
 </html>

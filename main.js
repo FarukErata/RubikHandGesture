@@ -1,6 +1,11 @@
 import { FilesetResolver, HandLandmarker }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+import { createHandTracker } from './pinch.js';
+import { createPoseTracker } from './pose.js';
+import * as ui from './interaction.js';
+import { reset, scramble } from './cube.js';
+
 
 
 const W = 640, H = 480;
@@ -11,6 +16,7 @@ const ctx    = canvas.getContext('2d');
 const status = document.getElementById('status');
 const cams   = document.getElementById('cams');
 const handInfo = document.getElementById('hand');
+const note   = document.getElementById('note');
 
 const MIRROR = true;
 
@@ -21,6 +27,11 @@ let raf = null;
 let frames = 0, lastTick = performance.now(), fps = 0;
 
 let handLandmarker = null;
+
+const tracker = createHandTracker({ swipeEnabled: false }); // shapes replaced it
+const poses = createPoseTracker();
+let lastMove = '';
+let moveFlash = null;   // { at } — brief confirmation on the feed
 
 ctx.textAlign = 'center';
 ctx.textBaseline = 'middle';
@@ -110,17 +121,14 @@ function loop() {
     const t1 = performance.now();
     if (frames % 30 === 0) console.log('detect ms:', (t1 - t0).toFixed(1));
 
-    if (results && results.landmarks.length > 0) {
-      handInfo.textContent = results.handednesses
-        .map(h => `${h[0].categoryName} ${(h[0].score * 100).toFixed(0)}%`)
-        .join('  ');
+    const hands = results?.landmarks ?? [];
+    for (const hand of hands) drawHand(hand);
 
-      for (const hand of results.landmarks) {
-        drawHand(hand);
-      }
-    } else {
-      handInfo.textContent = 'no hand';
-    }
+    // one hand drives the pointer; the first one detected wins. worldLandmarks
+    // are the metric 3D version of the same hand — see pose.js
+    driveGestures(hands[0] ?? null,
+                  results?.handednesses?.[0]?.[0],
+                  results?.worldLandmarks?.[0] ?? null);
   }
 
 
@@ -136,6 +144,148 @@ function loop() {
     status.textContent =
       `${s.width}×${s.height} · source ${s.frameRate ?? '?'}fps · drawing ${fps}fps`;
   }
+}
+
+// A hand can't comfortably reach the corners of the frame, so a region in the
+// middle of the frame is stretched to cover the whole cube canvas. Sensitivity
+// shrinks that region: the smaller it is, the further the pointer travels for
+// the same hand movement. 1.0 = the middle ~70%.
+const REACH_BASE = { hx: 0.35, hy: 0.38 }; // half-extents at sensitivity 1
+const REACH = { x0: 0, y0: 0, x1: 1, y1: 1 };
+const clamp01 = v => Math.min(1, Math.max(0, v));
+
+const modeInput = document.getElementById('pinch-mode');
+modeInput.addEventListener('change', () => ui.setPinchMode(modeInput.value));
+ui.setPinchMode(modeInput.value);
+
+const sensInput = document.getElementById('sens');
+const sensLabel = document.getElementById('sens-value');
+
+function setSensitivity(value) {
+  const s = Math.min(3, Math.max(0.5, Number(value) || 1));
+  const hx = REACH_BASE.hx / s, hy = REACH_BASE.hy / s;
+  REACH.x0 = 0.5 - hx; REACH.x1 = 0.5 + hx;
+  REACH.y0 = 0.5 - hy; REACH.y1 = 0.5 + hy;
+  sensLabel.textContent = `${s.toFixed(1)}×`;
+  try { localStorage.setItem('sensitivity', s); } catch {}
+}
+
+let stored = null;
+try { stored = localStorage.getItem('sensitivity'); } catch {}
+sensInput.value = stored ?? 1.6;
+setSensitivity(sensInput.value);
+sensInput.addEventListener('input', () => setSensitivity(sensInput.value));
+
+function toStage(p) {
+  return {
+    x: clamp01((p.x / W - REACH.x0) / (REACH.x1 - REACH.x0)) * W,
+    y: clamp01((p.y / H - REACH.y0) / (REACH.y1 - REACH.y0)) * H,
+  };
+}
+
+// Gesture → cube. Shapes, not motion: where the hand is doesn't matter.
+//   1-3 fingers, pointing right/left  moves that row right / left
+//   1-3 fingers, pointing up/down     moves that column up / down
+//   hold the shape ~450ms             commits the move
+//   pinch and move                    rotates or moves the whole cube
+function driveGestures(lms, handedness, world) {
+  const g = tracker.update(lms, toScreen);
+
+  if (!g.visible) {
+    poses.reset();   // a hand coming back shouldn't inherit a half-held shape
+    ui.orbitEnd();
+    ui.hideCursor();
+    ui.hideBands();
+    handInfo.textContent = 'no hand';
+    return;
+  }
+
+  const p = toStage({ x: g.palmX, y: g.palmY });   // palm, in canvas pixels
+  ui.showCursor(p.x, p.y, g.pinching ? 'pressed' : g.closing ? 'arming' : 'idle');
+
+  // pinch = global rotate/move, so you can bring the other faces round. It has
+  // priority: a shape made while pinching must not fire a turn.
+  if (g.pressed)       { ui.hideBands(); ui.orbitStart(p.x, p.y); }
+  else if (g.pinching) ui.orbitDrag(p.x, p.y);
+  else if (g.released) ui.orbitEnd();
+
+  // hand shape = which slab, and which way it turns
+  const shape = poses.update(lms, toScreen, { inhibit: g.pinching, world });
+
+  if (shape.valid) {
+    const intent = ui.poseIntent(shape);
+    ui.showBands(intent.zone, intent.only);
+  } else if (!g.pinching) {
+    ui.hideBands();
+  }
+
+  if (shape.fired) {
+    const move = ui.poseTurn(shape.fired);
+    lastMove = `${shapeLabel(shape.fired)}` +
+               ` → ${move.axis}${move.layer >= 0 ? '+' : ''}${move.layer}`;
+    moveFlash = { at: performance.now() };
+  }
+
+  drawPose(g, shape);
+
+  // live readout: without this there's no way to see what shape the model
+  // thinks you're making, or how close the dwell is to firing
+  handInfo.textContent = [
+    g.pinching
+      ? `● ${ui.pinchMode() === 'move' ? 'moving cube' : 'rotating view'}`
+      : `${shape.count} finger${shape.count === 1 ? '' : 's'} ` +
+        `${shape.thumb ? `thumb ${shape.thumb}` : shape.direction ?? '—'}` +
+        `${shape.valid ? '' : '  (rest)'}`,
+    // thumb diagnostics: gap is how extended it reads, lean which side
+    `thumb ${shape.thumbGap.toFixed(2)}/${poses.config.thumbOut}` +
+    ` lean ${shape.lean >= 0 ? '+' : ''}${shape.lean.toFixed(2)}`,
+    shape.charge > 0 ? `holding ${Math.round(shape.charge * 100)}%` : '',
+    lastMove ? `last ${lastMove}` : '',
+  ].filter(Boolean).join('   ');
+}
+
+// Feed overlay for the shape: finger count, pointing direction, and a ring
+// that fills over the dwell. save/restore around every font change — it is
+// context state, and the landmark labels inherit whatever is left set.
+const ARROW = { up: '↑', down: '↓', left: '←', right: '→' };
+
+// what the shape reads as: "2→" for a row/column push, "⟳" for a face turn
+// (no count there — the thumb is only two controls)
+const shapeLabel = ({ count, direction, thumb }) =>
+  thumb ? (thumb === 'right' ? '⟳' : '⟲') : `${count}${ARROW[direction] ?? '·'}`;
+
+function drawPose(g, shape) {
+  const closed = g.pinching;
+
+  ctx.strokeStyle = closed ? '#fff' : shape.valid ? '#0ff' : '#666';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(g.palmX, g.palmY, 10, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // dwell ring: fills clockwise, green the moment it completes
+  if (shape.charge > 0) {
+    ctx.strokeStyle = shape.charge >= 1 ? '#0f0' : '#ff0';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(g.palmX, g.palmY, 20, -Math.PI / 2,
+            -Math.PI / 2 + shape.charge * Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  if (shape.valid) {
+    ctx.fillStyle = shape.thumb ? '#ff0' : '#0ff';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillText(shapeLabel(shape), g.palmX, g.palmY - 36);
+  }
+
+  if (moveFlash && performance.now() - moveFlash.at < 400) {
+    ctx.fillStyle = '#0f0';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillText('✓', W / 2, H / 2);
+  }
+  ctx.restore();
 }
 
 //0                    wrist
@@ -154,6 +304,7 @@ const FINGERS = [
 ];
 
 function drawHand(lms) {
+    ctx.font = '12px system-ui, sans-serif'; // don't inherit whatever was set
 
     FINGERS.forEach((f, n) => {
         ctx.fillStyle = f.color;
@@ -189,6 +340,23 @@ function stop() {
 }
 
 cams.addEventListener('change', () => openCamera(cams.value));
+
+// Both are queued behind any turn still animating, so neither can fire
+// mid-rotation. A drag in progress is dropped first.
+function button(id, handler) {
+  const el = document.getElementById(id);
+  if (!el) { console.warn(`no #${id} in the page`); return; }
+  el.addEventListener('click', () => {
+    ui.pointerUp();
+    ui.clearHover();
+    // reset on an already-solved cube looks like nothing happened, so say so.
+    // Its own element: the gesture readout overwrites #hand every frame.
+    note.textContent = handler();
+  });
+}
+
+button('reset', () => { reset(); return 'cube reset'; });
+button('scramble', () => `scrambled: ${scramble().join(' ')}`);
 
 
 // release the hardware claim on navigate-away
